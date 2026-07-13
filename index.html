@@ -156,7 +156,7 @@
   <header>
     <div class="eyebrow"><span class="dot" id="statusDot"></span><span id="statusText">не запущено</span></div>
     <h1>Транскрибация — Groq Whisper</h1>
-    <div class="sub">Аудио режется на куски по 5 сек и распознаётся через Groq API.</div>
+    <div class="sub">Держит длинные записи (час-полтора): очередь с повторами при сбоях, автосохранение.</div>
   </header>
 
   <div class="error-box" id="errorBox"></div>
@@ -187,7 +187,7 @@
   </div>
 
   <div class="note">
-    <b>Как это работает.</b> Микрофон пишет аудио кусками по 12 секунд, каждый кусок уходит через твой Cloudflare Worker в Groq (модель whisper-large-v3) и возвращается текстом с пунктуацией. Задержка перед появлением текста — около 10-15 секунд на кусок, зато точность выше, чем при коротких кусках: модель видит больше контекста фразы целиком. Ключ Groq хранится только в воркере и в браузере не светится.
+    <b>Как это работает.</b> Микрофон пишет аудио кусками по 12 секунд через встроенный таймслайс браузера — это надёжнее держит ритм на длинных записях и в свёрнутых вкладках, чем ручной перезапуск. Каждый кусок встаёт в очередь и обрабатывается строго по порядку — если Groq ответит "превышен лимит", кусок ждёт и пробует снова (до 4 раз с нарастающей паузой), а не теряется молча. Текст автосохраняется в браузере по ходу записи — если вкладка упадёт, при следующем открытии сайт предложит восстановить. Куски, которые не удалось распознать после всех попыток, помечаются прямо в тексте, чтобы было видно пробел. Ключ Groq хранится только в воркере и в браузере не светится.
   </div>
 
 </div>
@@ -196,6 +196,8 @@
 (function(){
   const WORKER_URL = 'https://holy-sound-a929.latypovabdurashid.workers.dev';
   const CHUNK_MS = 12000;
+  const MAX_RETRIES = 4;
+  const STORAGE_KEY = 'transcriber_autosave_v1';
 
   const startBtn = document.getElementById('startBtn');
   const stopBtn = document.getElementById('stopBtn');
@@ -214,14 +216,19 @@
   let stream = null;
   let listening = false;
   let finalText = '';
-  let pendingCount = 0;
+  let wordTotal = 0;
   let startTime = null;
   let timerInterval = null;
+
+  let queue = [];
+  let queueBusy = false;
+  let nextSeq = 0;
 
   function setStatus(mode, text){
     statusDot.classList.remove('live','busy');
     if(mode) statusDot.classList.add(mode);
-    statusText.textContent = text;
+    const queueSuffix = queue.length > 0 ? (' · в очереди: ' + queue.length) : '';
+    statusText.textContent = text + queueSuffix;
   }
 
   function showError(msg){
@@ -234,21 +241,35 @@
   }
 
   function updateWordcount(){
-    const words = finalText.trim().split(/\s+/).filter(Boolean).length;
-    wordcountEl.textContent = words + (words === 1 ? ' слово' : (words >=2 && words<=4 ? ' слова' : ' слов'));
-  }
-
-  function render(){
-    transcriptBox.innerHTML =
-      (finalText ? '<span class="final">' + escapeHtml(finalText) + '</span>' : '') +
-      (pendingCount > 0 ? '<span class="pending"> [обрабатывается...]</span>' : '');
-    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+    wordcountEl.textContent = wordTotal + (wordTotal === 1 ? ' слово' : (wordTotal >=2 && wordTotal<=4 ? ' слова' : ' слов'));
   }
 
   function escapeHtml(str){
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+  }
+
+  function appendFinalText(text){
+    if(!text) return;
+    const span = document.createElement('span');
+    span.className = 'final';
+    span.textContent = (finalText ? ' ' : '') + text;
+    transcriptBox.appendChild(span);
+    finalText += (finalText ? ' ' : '') + text;
+    wordTotal += text.trim().split(/\s+/).filter(Boolean).length;
+    updateWordcount();
+    transcriptBox.scrollTop = transcriptBox.scrollHeight;
+    saveToStorage();
+  }
+
+  function appendErrorMarker(seq){
+    const span = document.createElement('span');
+    span.className = 'pending';
+    span.style.color = 'var(--danger)';
+    span.textContent = ' [кусок #' + seq + ': не распознан] ';
+    transcriptBox.appendChild(span);
+    transcriptBox.scrollTop = transcriptBox.scrollHeight;
   }
 
   function formatTime(ms){
@@ -269,66 +290,125 @@
     clearInterval(timerInterval);
   }
 
-  async function sendChunk(blob){
-    pendingCount++;
-    setStatus('busy', 'распознаю...');
-    render();
-
+  function saveToStorage(){
     try{
-      const formData = new FormData();
-      formData.append('file', blob, 'chunk.webm');
-      formData.append('model', 'whisper-large-v3');
-      if(langSelect.value) formData.append('language', langSelect.value);
-
-      const resp = await fetch(WORKER_URL, {
-        method: 'POST',
-        body: formData
-      });
-
-      if(!resp.ok){
-        const errData = await resp.json().catch(()=>({}));
-        throw new Error(errData.error?.message || ('HTTP ' + resp.status));
-      }
-
-      const data = await resp.json();
-      const text = (data.text || '').trim();
-      if(text){
-        finalText += (finalText ? ' ' : '') + text;
-        updateWordcount();
-      }
-    }catch(err){
-      showError('Ошибка Groq API: ' + err.message);
-    }finally{
-      pendingCount--;
-      if(listening) setStatus('live', 'слушаю');
-      render();
-    }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        text: finalText,
+        wordTotal: wordTotal,
+        savedAt: Date.now()
+      }));
+    }catch(e){}
   }
 
-  function startRecordingLoop(){
+  function clearStorage(){
+    try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}
+  }
+
+  function checkForRestore(){
+    try{
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if(!raw) return;
+      const saved = JSON.parse(raw);
+      if(saved && saved.text && saved.text.trim()){
+        const minutesAgo = Math.round((Date.now() - saved.savedAt) / 60000);
+        const restore = confirm('Найден несохранённый текст из прошлой сессии (' + saved.wordTotal + ' слов, ' + minutesAgo + ' мин назад). Восстановить?');
+        if(restore){
+          finalText = saved.text;
+          wordTotal = saved.wordTotal || 0;
+          const span = document.createElement('span');
+          span.className = 'final';
+          span.textContent = finalText;
+          transcriptBox.appendChild(span);
+          updateWordcount();
+        } else {
+          clearStorage();
+        }
+      }
+    }catch(e){}
+  }
+
+  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+  async function sendChunkWithRetry(blob, seq){
+    let attempt = 0;
+    while(attempt <= MAX_RETRIES){
+      try{
+        const formData = new FormData();
+        formData.append('file', blob, 'chunk.webm');
+        formData.append('model', 'whisper-large-v3');
+        if(langSelect.value) formData.append('language', langSelect.value);
+
+        const resp = await fetch(WORKER_URL, { method: 'POST', body: formData });
+
+        if(resp.status === 429){
+          const waitMs = Math.min(2000 * Math.pow(2, attempt), 20000);
+          hideError();
+          showError('Groq: превышен лимит запросов, жду ' + Math.round(waitMs/1000) + ' сек и пробую кусок #' + seq + ' снова...');
+          await sleep(waitMs);
+          attempt++;
+          continue;
+        }
+
+        if(!resp.ok){
+          const errData = await resp.json().catch(()=>({}));
+          throw new Error(errData.error?.message || ('HTTP ' + resp.status));
+        }
+
+        const data = await resp.json();
+        hideError();
+        return (data.text || '').trim();
+      }catch(err){
+        attempt++;
+        if(attempt > MAX_RETRIES){
+          showError('Кусок #' + seq + ' не удалось распознать после ' + MAX_RETRIES + ' попыток: ' + err.message);
+          return null;
+        }
+        await sleep(1000 * attempt);
+      }
+    }
+    return null;
+  }
+
+  async function processQueue(){
+    if(queueBusy) return;
+    queueBusy = true;
+
+    while(queue.length > 0){
+      const item = queue.shift();
+      setStatus(listening ? 'live' : null, listening ? 'слушаю' : 'остановлено');
+      setStatus('busy', 'распознаю кусок #' + item.seq + '...');
+
+      const text = await sendChunkWithRetry(item.blob, item.seq);
+      if(text){
+        appendFinalText(text);
+      } else if(text === null){
+        appendErrorMarker(item.seq);
+      }
+
+      setStatus(listening ? 'live' : null, listening ? 'слушаю' : 'остановлено');
+    }
+
+    queueBusy = false;
+  }
+
+  function enqueueChunk(blob){
+    if(!blob || blob.size < 1000) return;
+    queue.push({ blob, seq: nextSeq++ });
+    processQueue();
+  }
+
+  function startRecording(){
     mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
 
     mediaRecorder.ondataavailable = (e) => {
-      if(e.data && e.data.size > 1000){
-        sendChunk(e.data);
-      }
+      enqueueChunk(e.data);
     };
 
-    mediaRecorder.onstop = () => {
-      if(listening){
-        // перезапускаем следующий кусок
-        startRecordingLoop();
-        mediaRecorder.start();
-        setTimeout(()=>{
-          if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
-        }, CHUNK_MS);
-      }
+    mediaRecorder.onerror = (e) => {
+      showError('Ошибка записи: ' + (e.error ? e.error.message : 'неизвестная ошибка'));
     };
 
-    mediaRecorder.start();
-    setTimeout(()=>{
-      if(mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
-    }, CHUNK_MS);
+    mediaRecorder.start(CHUNK_MS);
   }
 
   startBtn.addEventListener('click', async () => {
@@ -346,12 +426,12 @@
     langSelect.disabled = true;
     setStatus('live', 'слушаю');
     startTimer();
-    startRecordingLoop();
+    startRecording();
   });
 
   stopBtn.addEventListener('click', () => {
     listening = false;
-    if(mediaRecorder && mediaRecorder.state === 'recording'){
+    if(mediaRecorder && mediaRecorder.state !== 'inactive'){
       mediaRecorder.stop();
     }
     if(stream){
@@ -386,10 +466,14 @@
 
   clearBtn.addEventListener('click', () => {
     finalText = '';
+    wordTotal = 0;
     transcriptBox.innerHTML = '';
     updateWordcount();
     timerEl.textContent = '00:00';
+    clearStorage();
   });
+
+  checkForRestore();
 })();
 </script>
 
